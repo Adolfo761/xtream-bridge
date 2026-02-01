@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, redirect
 import requests
 import re
-import base64
+import hashlib
 
 app = Flask(__name__)
 
@@ -10,19 +10,14 @@ M3U_URL = "https://raw.githack.com/Adolfo761/lista-iptv-permanente/main/LISTA_DE
 USER_VALIDO = "adolfo"
 PASS_VALIDO = "vip2026"
 
-# --- FUNCIONES AUXILIARES ---
-def encode_id(url):
-    # Convierte la URL real en un ID seguro y único
-    return base64.urlsafe_b64encode(url.strip().encode()).decode().rstrip("=")
-
-def decode_id(sid):
-    # Recupera la URL real desde el ID
-    try:
-        padding = 4 - (len(sid) % 4)
-        sid += "=" * padding
-        return base64.urlsafe_b64decode(sid.encode()).decode()
-    except:
-        return None
+# --- GENERADOR DE IDs NUMÉRICOS ESTABLES ---
+def get_numeric_id(url):
+    # Crea una huella digital única (MD5) de la URL
+    hash_object = hashlib.md5(url.strip().encode())
+    # La convierte a un número hexadecimal y luego a entero
+    full_int = int(hash_object.hexdigest(), 16)
+    # Lo recorta a 8 dígitos para que sea un ID seguro (ej: 48291043)
+    return str(full_int % 100000000)
 
 def parse_m3u(m3u_content):
     streams = []
@@ -42,29 +37,32 @@ def parse_m3u(m3u_content):
             categories.add(current_cat)
             
             # Extraer nombre
-            name = line.split(",")[-1].strip()
+            name_parts = line.split(",")
+            name = name_parts[-1].strip()
             
             # Extraer logo
             logo_match = re.search(r'tvg-logo="([^"]+)"', line)
             logo = logo_match.group(1) if logo_match else ""
             
         elif line.startswith("http"):
-            # USAMOS BASE64 PARA QUE EL ID SEA ESTABLE Y RECUPERABLE
-            stream_id = encode_id(line)
+            # GENERAMOS EL ID NUMÉRICO
+            stream_id = get_numeric_id(line)
             
-            # Detectar si es VOD (básico)
-            stream_type = "movie" if "/movie/" in line or line.endswith((".mp4", ".mkv")) else "live"
+            # Detectar tipo
+            is_movie = "/movie/" in line or line.endswith((".mp4", ".mkv", ".avi"))
+            stream_type = "movie" if is_movie else "live"
+            ext = "mp4" if is_movie else "ts"
             
             streams.append({
-                "num": 0,
+                "num": stream_id,
                 "name": name,
                 "stream_type": stream_type,
                 "stream_id": stream_id,
                 "stream_icon": logo,
                 "epg_channel_id": name,
                 "added": "1644400000",
-                "category_id": str(abs(hash(current_cat)) % 10000), # ID numérico simple para cat
-                "container_extension": "ts",
+                "category_id": str(abs(hash(current_cat)) % 10000), 
+                "container_extension": ext,
                 "custom_sid": "",
                 "direct_source": line
             })
@@ -81,13 +79,12 @@ def xtream_api():
     if user != USER_VALIDO or password != PASS_VALIDO:
         return jsonify({"user_info": {"auth": 0}, "server_info": {}})
 
-    # LOGIN
     if action == 'login':
         return jsonify({
             "user_info": {
                 "username": user,
                 "password": password,
-                "message": "Conectado a Adolfo Bridge V2",
+                "message": "Adolfo Bridge V3 (Numeric)",
                 "auth": 1,
                 "status": "Active",
                 "exp_date": "1799999999",
@@ -109,7 +106,7 @@ def xtream_api():
             }
         })
 
-    # DESCARGAR LISTA (Solo si es necesario)
+    # Descarga y parseo (común para todas las peticiones de lista)
     if action in ['get_live_streams', 'get_live_categories', 'get_vod_streams', 'get_vod_categories']:
         try:
             r = requests.get(M3U_URL)
@@ -123,39 +120,40 @@ def xtream_api():
             return jsonify(json_cats)
             
         elif action == 'get_live_streams':
-            # Filtrar solo canales en vivo
             return jsonify([s for s in streams if s['stream_type'] == 'live'])
 
         elif action == 'get_vod_categories':
-             # Usamos las mismas categorías por simplicidad, o podrías filtrar
             json_cats = [{"category_id": str(abs(hash(c)) % 10000), "category_name": c, "parent_id": 0} for c in cats]
             return jsonify(json_cats)
             
         elif action == 'get_vod_streams':
-            # Filtrar solo peliculas
             return jsonify([s for s in streams if s['stream_type'] == 'movie'])
 
     return jsonify([])
 
-# --- RUTAS DE REPRODUCCIÓN (MAGIC REDIRECT) ---
-# Estas rutas capturan el intento de reproducir y redirigen a la fuente real
-
+# --- REDIRECCIÓN MÁGICA ---
+# Cuando la app pide reproducir el ID numérico, buscamos qué URL real le corresponde
 @app.route('/live/<user>/<password>/<stream_id>.ts')
 @app.route('/live/<user>/<password>/<stream_id>.m3u8')
-def live_play(user, password, stream_id):
-    # Quitamos la extensión si viene en el ID
-    clean_id = stream_id.replace('.ts', '').replace('.m3u8', '')
-    real_url = decode_id(clean_id)
-    if real_url:
-        return redirect(real_url, code=302)
-    return "Error: Canal no encontrado", 404
-
 @app.route('/movie/<user>/<password>/<stream_id>.<ext>')
-def movie_play(user, password, stream_id, ext):
-    real_url = decode_id(stream_id)
-    if real_url:
-        return redirect(real_url, code=302)
-    return "Error: Pelicula no encontrada", 404
+def universal_play(user, password, stream_id, ext=None):
+    # Limpiamos el ID (quitamos extensiones si vienen pegadas)
+    clean_id = stream_id.replace('.ts', '').replace('.m3u8', '').replace('.mp4', '').replace('.mkv', '')
+    
+    try:
+        # Tenemos que descargar la lista para saber qué URL corresponde a este ID numérico
+        r = requests.get(M3U_URL)
+        r.encoding = 'utf-8'
+        streams, _ = parse_m3u(r.text)
+        
+        # Buscar el stream que tenga este ID
+        for s in streams:
+            if s['stream_id'] == clean_id:
+                return redirect(s['direct_source'], code=302)
+                
+        return "Error: ID no encontrado en la lista actual", 404
+    except:
+        return "Error interno", 500
 
 if __name__ == '__main__':
     app.run(debug=True)
