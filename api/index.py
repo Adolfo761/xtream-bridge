@@ -1,15 +1,28 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import requests
 import re
+import base64
 
 app = Flask(__name__)
 
 # --- CONFIGURACIÓN ---
-# Tu lista M3U definitiva (Usamos githack para evitar bloqueos)
 M3U_URL = "https://raw.githack.com/Adolfo761/lista-iptv-permanente/main/LISTA_DEFINITIVA_PERMANENTE.m3u"
-# Credenciales Falsas (Tus clientes usarán estas)
 USER_VALIDO = "adolfo"
 PASS_VALIDO = "vip2026"
+
+# --- FUNCIONES AUXILIARES ---
+def encode_id(url):
+    # Convierte la URL real en un ID seguro y único
+    return base64.urlsafe_b64encode(url.strip().encode()).decode().rstrip("=")
+
+def decode_id(sid):
+    # Recupera la URL real desde el ID
+    try:
+        padding = 4 - (len(sid) % 4)
+        sid += "=" * padding
+        return base64.urlsafe_b64decode(sid.encode()).decode()
+    except:
+        return None
 
 def parse_m3u(m3u_content):
     streams = []
@@ -22,13 +35,13 @@ def parse_m3u(m3u_content):
         if not line: continue
         
         if line.startswith("#EXTINF"):
-            # Intentar extraer categoria
+            # Extraer categoria
             cat_match = re.search(r'group-title="([^"]+)"', line)
             if cat_match:
                 current_cat = cat_match.group(1)
             categories.add(current_cat)
             
-            # Extraer nombre (todo después de la última coma)
+            # Extraer nombre
             name = line.split(",")[-1].strip()
             
             # Extraer logo
@@ -36,23 +49,28 @@ def parse_m3u(m3u_content):
             logo = logo_match.group(1) if logo_match else ""
             
         elif line.startswith("http"):
-            # Crear un ID único basado en la URL
-            stream_id = abs(hash(line)) % 1000000
+            # USAMOS BASE64 PARA QUE EL ID SEA ESTABLE Y RECUPERABLE
+            stream_id = encode_id(line)
+            
+            # Detectar si es VOD (básico)
+            stream_type = "movie" if "/movie/" in line or line.endswith((".mp4", ".mkv")) else "live"
             
             streams.append({
-                "num": stream_id,
+                "num": 0,
                 "name": name,
-                "stream_type": "live",
+                "stream_type": stream_type,
                 "stream_id": stream_id,
                 "stream_icon": logo,
-                "epg_channel_id": "",
+                "epg_channel_id": name,
                 "added": "1644400000",
-                "category_id": abs(hash(current_cat)) % 1000,
+                "category_id": str(abs(hash(current_cat)) % 10000), # ID numérico simple para cat
                 "container_extension": "ts",
                 "custom_sid": "",
                 "direct_source": line
             })
     return streams, list(categories)
+
+# --- RUTAS DE LA API ---
 
 @app.route('/player_api.php')
 def xtream_api():
@@ -60,31 +78,30 @@ def xtream_api():
     password = request.args.get('password')
     action = request.args.get('action', 'login')
 
-    # 1. Seguridad
     if user != USER_VALIDO or password != PASS_VALIDO:
         return jsonify({"user_info": {"auth": 0}, "server_info": {}})
 
-    # 2. Login
+    # LOGIN
     if action == 'login':
         return jsonify({
             "user_info": {
                 "username": user,
                 "password": password,
-                "message": "Bienvenido a Adolfo TV",
+                "message": "Conectado a Adolfo Bridge V2",
                 "auth": 1,
                 "status": "Active",
                 "exp_date": "1799999999",
                 "is_trial": "0",
                 "active_cons": "0",
                 "created_at": "1644400000",
-                "max_connections": "1",
+                "max_connections": "10",
                 "allowed_output_formats": ["m3u8", "ts", "rtmp"]
             },
             "server_info": {
                 "url": request.host_url,
-                "port": "80",
+                "port": "443",
                 "https_port": "443",
-                "server_protocol": "http",
+                "server_protocol": "https",
                 "rtmp_port": "8880",
                 "timezone": "America/Santo_Domingo",
                 "timestamp_now": 1644400000,
@@ -92,28 +109,53 @@ def xtream_api():
             }
         })
 
-    # 3. Descargar lista real (solo si pide streams)
-    if action in ['get_live_streams', 'get_live_categories']:
+    # DESCARGAR LISTA (Solo si es necesario)
+    if action in ['get_live_streams', 'get_live_categories', 'get_vod_streams', 'get_vod_categories']:
         try:
             r = requests.get(M3U_URL)
-            r.encoding = 'utf-8' # Forzar UTF-8 para tildes
+            r.encoding = 'utf-8'
             streams, cats = parse_m3u(r.text)
-        except Exception as e:
+        except:
             return jsonify([])
 
         if action == 'get_live_categories':
-            json_cats = [{"category_id": abs(hash(c)) % 1000, "category_name": c, "parent_id": 0} for c in cats]
+            json_cats = [{"category_id": str(abs(hash(c)) % 10000), "category_name": c, "parent_id": 0} for c in cats]
             return jsonify(json_cats)
             
         elif action == 'get_live_streams':
-            return jsonify(streams)
+            # Filtrar solo canales en vivo
+            return jsonify([s for s in streams if s['stream_type'] == 'live'])
 
-    # 4. VOD (Películas) - Retornamos vacío por ahora para no saturar
-    if action == 'get_vod_streams' or action == 'get_vod_categories':
-        return jsonify([])
+        elif action == 'get_vod_categories':
+             # Usamos las mismas categorías por simplicidad, o podrías filtrar
+            json_cats = [{"category_id": str(abs(hash(c)) % 10000), "category_name": c, "parent_id": 0} for c in cats]
+            return jsonify(json_cats)
+            
+        elif action == 'get_vod_streams':
+            # Filtrar solo peliculas
+            return jsonify([s for s in streams if s['stream_type'] == 'movie'])
 
     return jsonify([])
 
-# Vercel necesita esto
+# --- RUTAS DE REPRODUCCIÓN (MAGIC REDIRECT) ---
+# Estas rutas capturan el intento de reproducir y redirigen a la fuente real
+
+@app.route('/live/<user>/<password>/<stream_id>.ts')
+@app.route('/live/<user>/<password>/<stream_id>.m3u8')
+def live_play(user, password, stream_id):
+    # Quitamos la extensión si viene en el ID
+    clean_id = stream_id.replace('.ts', '').replace('.m3u8', '')
+    real_url = decode_id(clean_id)
+    if real_url:
+        return redirect(real_url, code=302)
+    return "Error: Canal no encontrado", 404
+
+@app.route('/movie/<user>/<password>/<stream_id>.<ext>')
+def movie_play(user, password, stream_id, ext):
+    real_url = decode_id(stream_id)
+    if real_url:
+        return redirect(real_url, code=302)
+    return "Error: Pelicula no encontrada", 404
+
 if __name__ == '__main__':
     app.run(debug=True)
